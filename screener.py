@@ -442,3 +442,4 @@ else:
 
     Configure the **drop %** and **SMA upper buffer** in the sidebar, then press **Run Screener**.
     """)
+# repo visibility changed to public
