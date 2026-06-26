@@ -170,6 +170,7 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
     dip_date = None
     dip_price = None
     flag2_date = None
+    flag2_price = None
     state_date = None   # mirrors app.py's state_date for unified expiry tracking
 
     events_log = []
@@ -192,7 +193,7 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
                 state = 0
                 flag1_date = flag1_price = None
                 dip_date = dip_price = None
-                flag2_date = state_date = None
+                flag2_date = flag2_price = state_date = None
                 continue
 
         # ── State transitions ───────────────────────────────────────────────
@@ -233,6 +234,7 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
             if aligned:
                 state = 3
                 flag2_date = date
+                flag2_price = price
                 state_date = None   # no expiry once a buy signal fires
                 if in_reporting_window:
                     events_log.append({
@@ -278,6 +280,10 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
                 round(((dip_price - flag1_price) / flag1_price) * 100, 2)
                 if dip_price is not None else '—'
             )
+            flag2_pct_from_flag1 = (
+                round(((flag2_price - flag1_price) / flag1_price) * 100, 2)
+                if flag2_price is not None else '—'
+            )
 
             active_setup = {
                 'Ticker':            clean_ticker,
@@ -288,6 +294,8 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
                 'Dip Price':         round(dip_price, 2) if dip_price is not None else '—',
                 'Dip % from Flag 1': dip_pct_from_flag1,
                 'Flag 2 Date':       flag2_date.date() if flag2_date is not None else '—',
+                'Flag 2 Price':      round(flag2_price, 2) if flag2_price is not None else '—',
+                'Flag 2 % from Flag 1': flag2_pct_from_flag1,
                 'Latest Price':      round(latest_price, 2),
                 'SMA 50':            round(sma50,  2),
                 'SMA 100':           round(sma100, 2),
@@ -350,7 +358,7 @@ if st.button("🔍 Run Screener", type="primary"):
     DISPLAY_COLS = [
         'Ticker', 'Flag 1 Date', 'Flag 1 Price',
         'Dip Date', 'Dip Price', 'Dip % from Flag 1',
-        'Flag 2 Date', 'Latest Price',
+        'Flag 2 Date', 'Flag 2 Price', 'Flag 2 % from Flag 1', 'Latest Price',
         'SMA 50', 'SMA 100', 'SMA 200',
         '% from Flag 1', 'Bull Aligned Now'
     ]
