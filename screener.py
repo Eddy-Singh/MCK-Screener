@@ -16,11 +16,7 @@ st.markdown(
 )
 
 # ── CONSTANTS ──────────────────────────────────────────────────────────────────
-SETUP_EXPIRY_DAYS = 60      # Hard-coded as per requirement
-# FIX #1: 260 calendar days (~185 trading days) was NOT enough to compute a
-# 200-day SMA. We need at least 200 trading days of history, which requires
-# ~300+ calendar days of fetching, matching app.py's approach of fetching
-# 300 days before the analysis window starts.
+SETUP_EXPIRY_DAYS = 60
 LOOKBACK_DAYS = 400         # ~285 trading days — safely covers 200 SMA warmup
 CURRENCY = "₹"
 
@@ -86,10 +82,18 @@ as_of_date = st.sidebar.date_input(
     max_value=datetime.date.today(),
     help="Screen the universe as if today were this date. Use any past date to replay historical setups."
 )
+
+# Live price only makes sense when screening as of today
+is_today = (as_of_date == datetime.date.today())
+
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     f"**Setup Expiry Window:** `{SETUP_EXPIRY_DAYS} days` *(fixed)*")
 st.sidebar.markdown(f"**SMA Lookback:** `{LOOKBACK_DAYS} calendar days`")
+if is_today:
+    st.sidebar.markdown("🟢 **Price:** Live (~15-min delayed)")
+else:
+    st.sidebar.markdown("🟡 **Price:** Historical close (past date selected)")
 st.sidebar.markdown("---")
 
 with st.sidebar.expander(f"📋 Universe ({len(NIFTY_250_TICKERS)} stocks)", expanded=False):
@@ -107,6 +111,24 @@ def safe_float(val):
     if isinstance(val, pd.Series):
         return float(val.iloc[0])
     return float(val)
+
+
+def fetch_live_price(ticker: str) -> float | None:
+    """
+    Fetch the latest traded price via a 1-minute intraday candle.
+    Yahoo Finance NSE data is ~15 minutes delayed.
+    Returns None if market is closed or intraday data is unavailable.
+    """
+    try:
+        intraday = yf.download(ticker, period="1d", interval="1m",
+                               progress=False)
+        if isinstance(intraday.columns, pd.MultiIndex):
+            intraday.columns = intraday.columns.get_level_values(0)
+        if intraday is not None and not intraday.empty:
+            return float(intraday["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
 
 
 def is_bull_aligned(row, upper_buf):
@@ -131,20 +153,22 @@ def is_bull_aligned(row, upper_buf):
 
 # ── SCREENING LOGIC ─────────────────────────────────────────────────────────────
 
-def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
+def screen_ticker(ticker, upper_buf, drop_pct, as_of_date, live_price: float | None):
     """
-    Runs the same 3-state machine as app.py's backtest engine and returns:
+    Runs the 3-state machine and returns:
       1. A dict describing the stock's current active setup stage (or None)
       2. A list of historical events triggered within the 60-day reporting window
+
+    live_price: pre-fetched intraday price for today's run; None for historical runs
+                or when intraday data was unavailable (falls back to last daily close).
     """
     end_date = as_of_date
-    # FIX #1 applied: fetch 400 calendar days back so SMA-200 is fully warmed up
     start_date = end_date - datetime.timedelta(days=LOOKBACK_DAYS)
 
     try:
         df = yf.download(ticker, start=start_date,
                          end=end_date, progress=False)
-        if df.empty or len(df) < 205:   # must have at least 205 rows for SMA-200
+        if df.empty or len(df) < 205:
             return None, []
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -163,18 +187,15 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
     today = pd.Timestamp(end_date)
     window_start = today - pd.Timedelta(days=SETUP_EXPIRY_DAYS)
 
-    # ── State machine variables (mirrors app.py stock_states) ──────────────
+    # ── State machine ──────────────────────────────────────────────────────
     state = 0
-    flag1_date = None
-    flag1_price = None   # FIX #2: locked at first-entry price, NEVER updated
-    dip_date = None
-    dip_price = None
-    flag2_date = None
-    state_date = None   # mirrors app.py's state_date for unified expiry tracking
+    flag1_date = flag1_price = None
+    dip_date = dip_price = None
+    flag2_date = flag2_price = None
+    state_date = None
 
     events_log = []
     clean_ticker = ticker.replace('.NS', '')
-
     dates = df.index.sort_values()
 
     for date in dates:
@@ -183,25 +204,21 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
         aligned = is_bull_aligned(row, upper_buf)
         in_reporting_window = (date >= window_start)
 
-        # ── Expiry check (matches app.py: days_waiting > max_setup_days) ──
-        # FIX #3: use a single state_date per stage, reset when stage changes,
-        # consistent with how app.py tracks it for states 1 and 2.
+        # Expiry check
         if state in [1, 2] and state_date is not None:
-            days_waiting = (date - state_date).days
-            if days_waiting > SETUP_EXPIRY_DAYS:
+            if (date - state_date).days > SETUP_EXPIRY_DAYS:
                 state = 0
                 flag1_date = flag1_price = None
                 dip_date = dip_price = None
-                flag2_date = state_date = None
+                flag2_date = flag2_price = state_date = None
                 continue
 
-        # ── State transitions ───────────────────────────────────────────────
-
+        # Transitions
         if state == 0:
             if aligned:
                 state = 1
                 flag1_date = date
-                flag1_price = price   # FIX #2: locked here, never raised again
+                flag1_price = price
                 state_date = date
                 if in_reporting_window:
                     events_log.append({
@@ -212,15 +229,11 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
                     })
 
         elif state == 1:
-            # FIX #2: removed `flag1_price = max(flag1_price, price)`.
-            # app.py never updates the flag price after the initial entry.
-            # Raising it continuously makes the dip threshold a moving target
-            # that gets progressively harder to trigger.
             if price <= flag1_price * (1 - drop_pct):
                 state = 2
                 dip_date = date
                 dip_price = price
-                state_date = date   # reset expiry clock for stage 2
+                state_date = date
                 if in_reporting_window:
                     events_log.append({
                         'Ticker': clean_ticker,
@@ -233,7 +246,8 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
             if aligned:
                 state = 3
                 flag2_date = date
-                state_date = None   # no expiry once a buy signal fires
+                flag2_price = price
+                state_date = None
                 if in_reporting_window:
                     events_log.append({
                         'Ticker': clean_ticker,
@@ -243,57 +257,68 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date):
                     })
 
         elif state == 3:
-            # FIX #4: In app.py the trade is entered immediately on Flag 2 and
-            # the stock is no longer in 'watch' state — the screener equivalent
-            # is that a Flag 2 signal is final and does NOT reset if the price
-            # dips again slightly.  The original screener incorrectly reset to
-            # state 0 whenever alignment was lost, causing valid buy signals to
-            # silently disappear.
-            # We keep state 3 until the trade is theoretically closed (i.e. we
-            # don't model exits in the screener), so we do nothing here and let
-            # the signal remain displayed.
-            pass
+            pass   # signal is final; no reset
 
-    # ── Determine current active setup to surface in the UI ────────────────
-    # FIX #5: Removed the `flag1_date >= window_start` gate.  A setup whose
-    # Flag 1 fired more than 60 days ago can still have a *live* Dip or Flag 2
-    # event within the window.  We check the stage-relevant date instead.
+    # ── Build active_setup dict ────────────────────────────────────────────
     active_setup = None
     if state != 0:
-        # Choose the most-recent stage date to decide if it's "fresh" enough
-        relevant_date = flag2_date if flag2_date is not None else (
-            dip_date if dip_date is not None else flag1_date)
+        relevant_date = (flag2_date if flag2_date is not None
+                         else (dip_date if dip_date is not None else flag1_date))
 
         if relevant_date is not None and relevant_date >= window_start:
-            # Use last available row on or before as_of_date as "current"
             latest_row = df[df.index <= pd.Timestamp(as_of_date)].iloc[-1]
-            latest_price = safe_float(latest_row['Close'])
             sma50 = safe_float(latest_row['SMA_50'])
             sma100 = safe_float(latest_row['SMA_100'])
             sma200 = safe_float(latest_row['SMA_200'])
-            currently_aligned = is_bull_aligned(latest_row, upper_buf)
+
+            # ── KEY CHANGE: use live_price when available ──────────────────
+            # For today's runs we pass in the pre-fetched 1-min candle price.
+            # For historical (past-date) runs live_price is None, so we fall
+            # back to the last daily close just as before.
+            if live_price is not None:
+                latest_price = live_price
+                price_label = "Live Price (~15m)"
+            else:
+                latest_price = safe_float(latest_row['Close'])
+                price_label = "Latest Close"
+
+            currently_aligned = is_bull_aligned(
+                {**latest_row.to_dict(),
+                 'Close': latest_price,      # override close with live price
+                 'SMA_50': sma50,
+                 'SMA_100': sma100,
+                 'SMA_200': sma200},
+                upper_buf
+            )
 
             pct_from_flag1 = ((latest_price - flag1_price) / flag1_price) * 100
             dip_pct_from_flag1 = (
                 round(((dip_price - flag1_price) / flag1_price) * 100, 2)
                 if dip_price is not None else '—'
             )
+            flag2_pct_from_flag1 = (
+                round(((flag2_price - flag1_price) / flag1_price) * 100, 2)
+                if flag2_price is not None else '—'
+            )
 
             active_setup = {
-                'Ticker':            clean_ticker,
-                'Stage':             state,
-                'Flag 1 Date':       flag1_date.date(),
-                'Flag 1 Price':      round(flag1_price, 2),
-                'Dip Date':          dip_date.date() if dip_date is not None else '—',
-                'Dip Price':         round(dip_price, 2) if dip_price is not None else '—',
-                'Dip % from Flag 1': dip_pct_from_flag1,
-                'Flag 2 Date':       flag2_date.date() if flag2_date is not None else '—',
-                'Latest Price':      round(latest_price, 2),
-                'SMA 50':            round(sma50,  2),
-                'SMA 100':           round(sma100, 2),
-                'SMA 200':           round(sma200, 2),
-                '% from Flag 1':     round(pct_from_flag1, 2),
-                'Bull Aligned Now':  '✅' if currently_aligned else '❌',
+                'Ticker':               clean_ticker,
+                'Stage':                state,
+                'Flag 1 Date':          flag1_date.date(),
+                'Flag 1 Price':         round(flag1_price, 2),
+                'Dip Date':             dip_date.date() if dip_date is not None else '—',
+                'Dip Price':            round(dip_price, 2) if dip_price is not None else '—',
+                'Dip % from Flag 1':    dip_pct_from_flag1,
+                'Flag 2 Date':          flag2_date.date() if flag2_date is not None else '—',
+                'Flag 2 Price':         round(flag2_price, 2) if flag2_price is not None else '—',
+                'Flag 2 % from Flag 1': flag2_pct_from_flag1,
+                # dynamic column name
+                price_label:            round(latest_price, 2),
+                'SMA 50':               round(sma50,  2),
+                'SMA 100':              round(sma100, 2),
+                'SMA 200':              round(sma200, 2),
+                '% from Flag 1':        round(pct_from_flag1, 2),
+                'Bull Aligned Now':     '✅' if currently_aligned else '❌',
             }
 
     return active_setup, events_log
@@ -305,10 +330,11 @@ if st.button("🔍 Run Screener", type="primary"):
     tickers_to_scan = selected_tickers
     total = len(tickers_to_scan)
 
-    is_today = (as_of_date == datetime.date.today())
     date_label = "today" if is_today else f"**{as_of_date.strftime('%d %b %Y')}**"
     st.info(
-        f"Scanning **{total} stocks** as of {date_label} — this takes ~{total // 5}–{total // 3} seconds. Please wait…")
+        f"Scanning **{total} stocks** as of {date_label} — "
+        f"this takes ~{total // 5}–{total // 3} seconds. Please wait…"
+    )
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -317,11 +343,17 @@ if st.button("🔍 Run Screener", type="primary"):
     all_historical_events = []
 
     for i, ticker in enumerate(tickers_to_scan):
-        status_text.text(
-            f"Scanning {ticker.replace('.NS', '')} ({i+1}/{total})…")
+        clean = ticker.replace('.NS', '')
+        status_text.text(f"Scanning {clean} ({i+1}/{total})…")
+
+        # ── Fetch live price once per ticker (today only) ──────────────────
+        # For historical runs we skip the intraday call entirely — it would
+        # return today's data regardless of the as_of_date selected.
+        live_price = fetch_live_price(ticker) if is_today else None
 
         res, history = screen_ticker(
-            ticker, upper_buffer_pct, drop_condition_pct, as_of_date)
+            ticker, upper_buffer_pct, drop_condition_pct, as_of_date, live_price
+        )
 
         if res is not None:
             results.append(res)
@@ -334,10 +366,21 @@ if st.button("🔍 Run Screener", type="primary"):
     progress_bar.empty()
     status_text.empty()
 
-    # ── SPLIT BY STAGE ──────────────────────────────────────────────────────────
+    # ── SPLIT BY STAGE ─────────────────────────────────────────────────────
     stage3 = [r for r in results if r['Stage'] == 3]
     stage2 = [r for r in results if r['Stage'] == 2]
     stage1 = [r for r in results if r['Stage'] == 1]
+
+    price_col = "Live Price (~15m)" if is_today else "Latest Close"
+
+    DISPLAY_COLS = [
+        'Ticker', 'Flag 1 Date', 'Flag 1 Price',
+        'Dip Date', 'Dip Price', 'Dip % from Flag 1',
+        'Flag 2 Date', 'Flag 2 Price', 'Flag 2 % from Flag 1',
+        price_col,
+        'SMA 50', 'SMA 100', 'SMA 200',
+        '% from Flag 1', 'Bull Aligned Now'
+    ]
 
     st.success(
         f"Scan complete — "
@@ -345,53 +388,48 @@ if st.button("🔍 Run Screener", type="primary"):
         f"**{len(stage2)} Dipped** | "
         f"**{len(stage1)} Flag 1 Watch** | "
         f"out of {total} stocks scanned"
+        + (" *(prices ~15-min delayed)*" if is_today else "")
     )
 
-    DISPLAY_COLS = [
-        'Ticker', 'Flag 1 Date', 'Flag 1 Price',
-        'Dip Date', 'Dip Price', 'Dip % from Flag 1',
-        'Flag 2 Date', 'Latest Price',
-        'SMA 50', 'SMA 100', 'SMA 200',
-        '% from Flag 1', 'Bull Aligned Now'
-    ]
-
-    # ───── STAGE 3: READY TO BUY ─────────────────────────────────────────────
+    # ───── STAGE 3: READY TO BUY ──────────────────────────────────────────
     st.markdown("---")
     st.subheader("🚀 Stage 3 — Flag 2 Ready to Buy")
     st.caption(
         "These stocks have completed the full setup: bull-aligned (Flag 1) → dropped → re-aligned (Flag 2).")
     if stage3:
-        df3 = pd.DataFrame(stage3)[DISPLAY_COLS]
-        st.dataframe(df3, use_container_width=True)
+        df3 = pd.DataFrame(stage3)
+        st.dataframe(df3[[c for c in DISPLAY_COLS if c in df3.columns]],
+                     use_container_width=True)
     else:
         st.info("No stocks are at Stage 3 right now.")
 
-    # ───── STAGE 2: DIPPED ───────────────────────────────────────────────────
+    # ───── STAGE 2: DIPPED ────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📉 Stage 2 — Dipped, Waiting for Re-alignment")
     st.caption(
         "These stocks passed Flag 1 and have since dipped the required %. Watching for bull re-alignment.")
     if stage2:
-        df2 = pd.DataFrame(stage2)[DISPLAY_COLS]
-        st.dataframe(df2, use_container_width=True)
+        df2 = pd.DataFrame(stage2)
+        st.dataframe(df2[[c for c in DISPLAY_COLS if c in df2.columns]],
+                     use_container_width=True)
     else:
         st.info("No stocks are at Stage 2 right now.")
 
-    # ───── STAGE 1: FLAG 1 ───────────────────────────────────────────────────
+    # ───── STAGE 1: FLAG 1 ────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🏁 Stage 1 — Flag 1 Watch (Bull Aligned, No Dip Yet)")
     st.caption(
         "These stocks are currently in bull alignment. Waiting for them to pull back.")
     if stage1:
-        df1 = pd.DataFrame(stage1)[DISPLAY_COLS]
-        st.dataframe(df1, use_container_width=True)
+        df1 = pd.DataFrame(stage1)
+        st.dataframe(df1[[c for c in DISPLAY_COLS if c in df1.columns]],
+                     use_container_width=True)
     else:
         st.info("No stocks are at Stage 1 right now.")
 
-    # ───── SUMMARY MINI-CHART ────────────────────────────────────────────────
+    # ───── SUMMARY CHART ──────────────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns([1, 2])
-
     with col1:
         st.subheader("📊 Setup Pipeline Summary")
         summary_df = pd.DataFrame({
@@ -400,7 +438,7 @@ if st.button("🔍 Run Screener", type="primary"):
         }).set_index("Stage")
         st.bar_chart(summary_df)
 
-    # ───── HISTORICAL EVENT LOG ──────────────────────────────────────────────
+    # ───── HISTORICAL EVENT LOG ───────────────────────────────────────────
     st.markdown("---")
     st.subheader(
         f"📜 60-Day Historical Event Log (ending {as_of_date.strftime('%d %b %Y')})")
@@ -412,7 +450,6 @@ if st.button("🔍 Run Screener", type="primary"):
         history_df = pd.DataFrame(all_historical_events)
         history_df = history_df.sort_values(
             by="Date", ascending=False).reset_index(drop=True)
-
         st.dataframe(
             history_df,
             use_container_width=True,
@@ -428,7 +465,7 @@ if st.button("🔍 Run Screener", type="primary"):
         st.info("No historical milestones triggered in the last 60 days.")
 
 else:
-    # ── Landing state ──────────────────────────────────────────────────────────
+    # ── Landing state ──────────────────────────────────────────────────────
     st.markdown("""
     ### How the screener works
 
@@ -442,4 +479,3 @@ else:
 
     Configure the **drop %** and **SMA upper buffer** in the sidebar, then press **Run Screener**.
     """)
-# repo visibility changed to public
