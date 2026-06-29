@@ -253,11 +253,7 @@ def screen_ticker(ticker, upper_buf, drop_pct, as_of_date, live_price: float | N
                         'Ticker': clean_ticker,
                         'Date':   date.date(),
                         'Event':  '🚀 Flag 2 — READY TO BUY',
-                        'Price':  round(price, 2)
                     })
-
-        elif state == 3:
-            pass   # signal is final; no reset
 
     # ── Build active_setup dict ────────────────────────────────────────────
     active_setup = None
